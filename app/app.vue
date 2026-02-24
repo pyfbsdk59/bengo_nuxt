@@ -15,8 +15,17 @@
         <div class="row g-3">
           <div class="col-md-7">
             <div class="d-flex">
-              <input v-model="searchQuery" @keyup.enter="fetchStockData" type="text" class="form-control me-2" placeholder="輸入代號 (如 2330)">
-              <button @click="fetchStockData" class="btn btn-primary text-nowrap">查詢</button>
+              <input 
+                v-model="searchQuery" 
+                @keyup.enter="fetchStockData" 
+                type="text" 
+                class="form-control me-2" 
+                placeholder="輸入代號 (如 2330)"
+              >
+              <button @click="fetchStockData" class="btn btn-primary text-nowrap me-2">查詢</button>
+              <button @click="showList = !showList" class="btn btn-outline-secondary text-nowrap">
+                {{ showList ? '隱藏清單' : '已匯入清單' }}
+              </button>
             </div>
           </div>
           <div class="col-md-5">
@@ -30,7 +39,36 @@
         </div>
       </div>
 
-      <div v-if="stockRecords.length > 0">
+      <div v-if="showList" class="card p-3 mb-4 shadow-sm border-secondary">
+        <h5 class="fw-bold mb-3">📂 目前已匯入的股票資料</h5>
+        <div class="table-responsive">
+          <table class="table table-hover align-middle text-center">
+            <thead class="table-light">
+              <tr>
+                <th>股票代碼</th>
+                <th>股票名稱</th>
+                <th>最新資料日期</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="stock in importedStocks" :key="stock.stock_id">
+                <td class="fw-bold">{{ stock.stock_id }}</td>
+                <td>{{ stock.stock_name }}</td>
+                <td class="text-success">{{ stock.latest_date }}</td>
+                <td>
+                  <button @click="quickSearch(stock.stock_id)" class="btn btn-sm btn-primary">查看走勢</button>
+                </td>
+              </tr>
+              <tr v-if="importedStocks.length === 0">
+                <td colspan="4" class="text-muted">目前尚無匯入資料</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div v-if="stockRecords.length > 0 && !showList">
         <h3 class="text-center mb-3 fw-bold text-secondary">
           {{ searchQuery }} {{ stockNameDisplay }}
         </h3>
@@ -69,13 +107,17 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { Line } from 'vue-chartjs'
 import { Chart as ChartJS, CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend } from 'chart.js'
 
+// 註冊 Chart.js 核心元件
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend)
 
+// 初始化 Supabase 客戶端
 const supabase = useSupabaseClient()
+
+// 狀態管理
 const searchQuery = ref('')
 const stockNameDisplay = ref('')
 const stockRecords = ref([])
@@ -84,7 +126,41 @@ const messageType = ref('info')
 const isUploading = ref(false)
 let selectedFile = null
 
-// --- 檔案處理與匯入邏輯 (取代 views.py 中的 JSON 解析) ---
+// 清單狀態管理
+const importedStocks = ref([])
+const showList = ref(false)
+
+// ---------------------------
+// 1. 讀取「已匯入股票清單」
+// ---------------------------
+const fetchSummary = async () => {
+  const { data, error } = await supabase
+    .from('stock_summary')
+    .select('*')
+    .order('stock_id', { ascending: true })
+
+  if (error) {
+    console.error('取得清單失敗:', error)
+  } else {
+    importedStocks.value = data || []
+  }
+}
+
+// 點擊清單中的「查看走勢」按鈕
+const quickSearch = async (id) => {
+  searchQuery.value = id
+  showList.value = false // 關閉清單以顯示圖表
+  await fetchStockData()
+}
+
+// 頁面初次載入時抓取清單
+onMounted(() => {
+  fetchSummary()
+})
+
+// ---------------------------
+// 2. 檔案處理與匯入邏輯
+// ---------------------------
 const handleFileUpload = (event) => {
   selectedFile = event.target.files[0]
 }
@@ -111,6 +187,7 @@ const uploadJsonData = async () => {
       // 資料清洗轉換
       const batchData = history.map(row => {
         const d_str = String(row.date).split('.')[0]
+        // 將 20260219 轉為 2026-02-19 以符合 PostgreSQL DATE 格式
         const formattedDate = `${d_str.slice(0, 4)}-${d_str.slice(4, 6)}-${d_str.slice(6, 8)}`
         
         return {
@@ -128,7 +205,7 @@ const uploadJsonData = async () => {
       }).filter(row => row.date && !row.date.includes('undefined'))
 
       if (batchData.length > 0) {
-        // 使用 Supabase 的 upsert 實現 Django 中 ignore_conflicts=True 的效果
+        // Upsert 寫入資料庫，如果 stock_id + date 存在則更新，否則新增
         const { error } = await supabase
           .from('stock_data')
           .upsert(batchData, { onConflict: 'stock_id,date' })
@@ -136,20 +213,29 @@ const uploadJsonData = async () => {
         if (error) throw error
 
         showMessage(`成功匯入 ${batchData.length} 筆資料！`, 'success')
+        
+        // 匯入成功後自動切換至該股票並更新清單
         searchQuery.value = stock_id
         await fetchStockData()
+        await fetchSummary() 
+        showList.value = false
       }
     } catch (err) {
       console.error(err)
       showMessage(`解析或匯入失敗: ${err.message}`, 'danger')
     } finally {
       isUploading.value = false
+      // 清空檔案選擇器
+      selectedFile = null
+      document.querySelector('input[type="file"]').value = ''
     }
   }
   reader.readAsText(selectedFile)
 }
 
-// --- 資料查詢邏輯 ---
+// ---------------------------
+// 3. 查詢個股詳細資料
+// ---------------------------
 const fetchStockData = async () => {
   if (!searchQuery.value) return
   
@@ -167,6 +253,7 @@ const fetchStockData = async () => {
   if (data && data.length > 0) {
     stockRecords.value = data
     stockNameDisplay.value = data[0].stock_name
+    showList.value = false // 如果正在看清單，切換回圖表模式
     showMessage('', 'info') // 清除訊息
   } else {
     stockRecords.value = []
@@ -174,15 +261,17 @@ const fetchStockData = async () => {
   }
 }
 
+// ---------------------------
+// 4. 工具函數與圖表設定
+// ---------------------------
 const showMessage = (msg, type) => {
   message.value = msg
   messageType.value = type
 }
 
-// --- 圖表設定 (取代 template 內的 script 標籤) ---
 const chartData = computed(() => {
-  // 將資料反轉成時間正序（從舊到新）給圖表使用
-  const reversedData = [...stockRecords.value].reverse().slice(-180) // 取最近半年
+  // 將資料反轉成時間正序（從舊到新）給圖表使用，並取最近 180 筆
+  const reversedData = [...stockRecords.value].reverse().slice(-180) 
   return {
     labels: reversedData.map(d => d.date),
     datasets: [
@@ -211,12 +300,24 @@ const chartOptions = {
   responsive: true,
   interaction: { mode: 'index', intersect: false },
   scales: {
-    y: { type: 'linear', display: true, position: 'left', title: {display: true, text: '持股 %'} },
-    y1: { type: 'linear', display: true, position: 'right', grid: {drawOnChartArea: false}, title: {display: true, text: '股價'} }
+    y: { 
+      type: 'linear', 
+      display: true, 
+      position: 'left', 
+      title: { display: true, text: '持股 %' } 
+    },
+    y1: { 
+      type: 'linear', 
+      display: true, 
+      position: 'right', 
+      grid: { drawOnChartArea: false }, 
+      title: { display: true, text: '股價' } 
+    }
   }
 }
 </script>
 
 <style scoped>
 .card { border-radius: 15px; }
+.table-responsive { max-height: 600px; overflow-y: auto; }
 </style>
